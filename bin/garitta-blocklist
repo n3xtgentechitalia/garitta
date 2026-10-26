@@ -1,0 +1,151 @@
+#!/bin/bash
+# garitta-blocklist - import the Data-Shield IPv4 blocklist into CrowdSec as ban decisions.
+#
+# The list (https://github.com/duggytuxy/Data-Shield_IPv4_Blocklist) is downloaded, its SHA-256 and
+# entry count are verified against the metadata published on data-shield.eu, the content is
+# validated, and the result is imported with `cscli decisions import`. The bouncers already
+# registered on the Local API enforce it. cscli drops allowlisted IPs on its own.
+#
+# Usage: garitta-blocklist [--dry-run] [--help] [--version]
+# Config: /etc/default/garitta-blocklist    Logs: journalctl -u garitta-blocklist
+set -euo pipefail
+VERSION=0.1.0
+
+# ---- defaults, overridable in the config file ----
+PROFILE=standard        # standard | critical
+DURATION=36h            # keep it longer than the timer interval: one failed run leaves no gap
+BATCH=20000             # decisions per Local API request
+MIN=20000               # fewer entries than this = truncated list
+MAX=auto                # auto = 95% of the CrowdSec ipset maxelem (iptables/ipset bouncer), else 250000
+REQUIRE_SHA=yes         # yes = import only a copy whose SHA-256 matches the published metadata
+RETRIES=3               # verification rounds (metadata can lag behind a new publication)
+RETRY_WAIT=600          # seconds between rounds
+METADATA_URL=https://data-shield.eu/data/latest.json
+# primary publication (GitHub), mirror origin (GitLab), mirrors; {file} is replaced by the list file name
+MIRRORS="https://raw.githubusercontent.com/duggytuxy/Data-Shield_IPv4_Blocklist/refs/heads/main/{file}
+https://gitlab.com/duggytuxy/Data-Shield-IPv4-Blocklist/-/raw/main/{file}?ref_type=heads
+https://codeberg.org/duggytuxy21/Data-Shield_IPv4_Blocklist/raw/branch/main/{file}
+https://cdn.jsdelivr.net/gh/duggytuxy/Data-Shield_IPv4_Blocklist@refs/heads/main/{file}"
+CURL_PROTO='=https'     # allowed URL schemes (the test suite also enables file://)
+STATE_DIR=/var/lib/garitta/blocklist
+CONF=${GARITTA_BLOCKLIST_CONF:-/etc/default/garitta-blocklist}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+DRY_RUN=no
+for a in "$@"; do
+  case $a in
+    --dry-run) DRY_RUN=yes ;;
+    --version) echo "garitta-blocklist $VERSION"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
+  esac
+done
+
+case $PROFILE in
+  standard) FILE=prod_data-shield_ipv4_blocklist.txt ;;
+  critical) FILE=prod_critical_data-shield_ipv4_blocklist.txt ;;
+  *) echo "invalid PROFILE: $PROFILE (standard|critical)" >&2; exit 2 ;;
+esac
+REASON=${REASON:-data-shield-$PROFILE}
+
+mkdir -p "$STATE_DIR"
+exec 9>"$STATE_DIR/lock"
+flock -n 9 || { echo "another run is in progress"; exit 0; }
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+
+fetch() {
+  curl -fsSL --proto "$CURL_PROTO" --tlsv1.2 --max-time 120 --retry 2 --max-filesize 33554432 \
+       -A "garitta/$VERSION" -o "$2" "$1"
+}
+
+# ---- download and verify against the published SHA-256 ----
+src= verified=no exp_sha= exp_count= fallback=
+for ((try = 1; try <= RETRIES; try++)); do
+  exp_sha= exp_count=
+  if fetch "$METADATA_URL" "$W/meta.json"; then
+    read -r exp_sha exp_count < <(python3 -I -c '
+import sys, json
+p = json.load(open(sys.argv[1]))["profiles"][sys.argv[2]]
+print(p["sha256"], p["blocked"])' "$W/meta.json" "$PROFILE" 2>/dev/null) || exp_sha=
+  else
+    echo "metadata unavailable: $METADATA_URL"
+  fi
+  while read -r tpl; do
+    [ -n "$tpl" ] || continue
+    u=${tpl//\{file\}/$FILE}
+    fetch "$u" "$W/dl" || { echo "download failed: $u"; continue; }
+    sha=$(sha256sum "$W/dl" | cut -d' ' -f1)
+    if [ -n "$exp_sha" ] && [ "$sha" = "$exp_sha" ]; then
+      mv "$W/dl" "$W/raw"; src=$u verified=yes; break 2
+    fi
+    echo "SHA-256 does not match the metadata: $u"
+    [ -n "$fallback" ] || { mv "$W/dl" "$W/fallback"; fallback=$u; }
+  done <<< "$MIRRORS"
+  if [ "$try" -lt "$RETRIES" ]; then
+    echo "retrying in ${RETRY_WAIT}s ($try/$RETRIES)"; sleep "$RETRY_WAIT"
+  fi
+done
+if [ "$verified" != yes ]; then
+  if [ "$REQUIRE_SHA" = yes ] || [ -z "$fallback" ]; then
+    echo "no verified copy, import skipped (active decisions stay valid until they expire)"; exit 1
+  fi
+  mv "$W/fallback" "$W/raw"; src=$fallback exp_count=
+  echo "WARNING: SHA-256 not verified (REQUIRE_SHA=no), using $src"
+fi
+echo "list $PROFILE from $src (verified: $verified)"
+
+# ---- validate: one canonical IPv4 per line, no duplicates (the published Data-Shield format) ----
+read -r n bad dup nonpub < <(python3 -I - "$W/raw" "$W/clean" <<'PY'
+import sys, ipaddress
+seen, bad, dup, nonpub = set(), 0, 0, 0
+for line in open(sys.argv[1], encoding="ascii", errors="replace"):
+    s = line.strip()
+    try:
+        ip = ipaddress.IPv4Address(s)
+        if str(ip) != s:
+            raise ValueError
+    except ValueError:
+        bad += 1
+        continue
+    if not ip.is_global:
+        nonpub += 1
+    elif s in seen:
+        dup += 1
+    else:
+        seen.add(s)
+with open(sys.argv[2], "w") as f:
+    f.write("\n".join(sorted(seen, key=lambda x: ipaddress.IPv4Address(x))) + "\n")
+print(len(seen), bad, dup, nonpub)
+PY
+)
+[ -n "${nonpub:-}" ] || { echo "validation failed"; exit 1; }
+echo "valid $n, invalid lines $bad, duplicates $dup, non-public $nonpub"
+[ "$bad" -eq 0 ] || { echo "the list contains invalid lines, import skipped"; exit 1; }
+if [ -n "$exp_count" ] && [ "$((n + dup + nonpub))" -ne "$exp_count" ]; then
+  echo "count $n differs from the metadata ($exp_count), import skipped"; exit 1
+fi
+
+# ---- capacity: the firewall bouncer ipsets have a fixed maxelem ----
+if [ "$MAX" = auto ]; then
+  me=$(ipset list -t 2>/dev/null | awk '/^Name: crowdsec/{c=1} c && /^Header:/{for(i=1;i<=NF;i++) if($i=="maxelem") print $(i+1); c=0}' | sort -n | head -1 || true)
+  MAX=$(( ${me:-263158} * 95 / 100 ))
+fi
+if [ "$n" -lt "$MIN" ] || [ "$n" -gt "$MAX" ]; then
+  echo "count $n outside the range $MIN-$MAX, import skipped"; exit 1
+fi
+if [ "$DRY_RUN" = yes ]; then
+  echo "dry run: $n IPs would be imported as $DURATION bans (reason $REASON)"; exit 0
+fi
+
+# ---- import: cscli drops the IPs covered by Local API allowlists ----
+cp "$W/clean" "$STATE_DIR/$REASON.txt"
+out=$(cscli decisions import -i "$STATE_DIR/$REASON.txt" --format values --type ban \
+        --duration "$DURATION" --reason "$REASON" --batch "$BATCH" 2>&1) || { echo "$out"; exit 1; }
+allow=$(grep -c "is allowlisted by" <<<"$out" || true)
+grep -v "is allowlisted by" <<<"$out" | tail -3
+grep "is allowlisted by" <<<"$out" | head -20 || true
+echo "imported $((n - allow)) IPs as $DURATION bans (reason $REASON), skipped by allowlists: $allow"
+printf 'last_success=%s\nprofile=%s\nsource=%s\nverified=%s\nsha256=%s\nimported=%s\nallowlisted=%s\n' \
+  "$(date -u +%FT%TZ)" "$PROFILE" "$src" "$verified" "$(sha256sum "$W/raw" | cut -d' ' -f1)" \
+  "$((n - allow))" "$allow" > "$STATE_DIR/status"

@@ -1,0 +1,10 @@
+# garitta-blocklist configuration. Defaults are shown commented out.
+# Change values with `garitta set blocklist KEY=VALUE` or by editing this file.
+#PROFILE=standard        # standard | critical (see https://data-shield.eu/docs/)
+#DURATION=36h            # keep it longer than the timer interval
+#MAX=auto                # upper bound on entries; auto = 95% of the CrowdSec ipset maxelem
+#MIN=20000               # lower bound: fewer entries means a truncated list
+#REQUIRE_SHA=yes         # no = if verification fails, import the downloaded copy after format checks only
+#RETRIES=3
+#RETRY_WAIT=600
+#BATCH=20000

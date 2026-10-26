@@ -1,0 +1,28 @@
+#!/bin/bash
+# Test double for cscli. Answers come from files in $STUB_DIR; calls are appended to $STUB_DIR/calls.
+set -euo pipefail
+D=${STUB_DIR:?}
+echo "$*" >> "$D/calls"
+case "$1 ${2:-}" in
+  "allowlists list")    cat "$D/allowlists.csv" ;;
+  "allowlists inspect") cat "$D/allowlist-$3.csv" ;;
+  "alerts list")
+    origin=$(sed -n 's/.*--origin \([^ ]*\).*/\1/p' <<<"$*")
+    cat "$D/alerts-$origin.json" 2>/dev/null || echo null ;;
+  "decisions list")     cat "$D/decisions.csv" ;;
+  "decisions import")
+    f=$(sed -n 's/.*-i \([^ ]*\).*/\1/p' <<<"$*")
+    n=0
+    while read -r ip; do
+      if grep -qxF "$ip" "$D/allowlisted.txt" 2>/dev/null; then
+        echo "Value $ip is allowlisted by [test]"
+      else
+        n=$((n + 1))
+      fi
+    done < "$f"
+    echo "Imported $n decisions" ;;
+  "console status")     cat "$D/console.json" ;;
+  "lapi status")        echo "You can successfully interact with Local API (LAPI)" ;;
+  "bouncers list")      printf 'name,ip\nfw,127.0.0.1\n' ;;
+  *) echo "stub: unsupported: $*" >&2; exit 1 ;;
+esac

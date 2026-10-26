@@ -1,0 +1,10 @@
+# garitta-digest configuration. Defaults are shown commented out.
+# Change values with `garitta set digest KEY=VALUE` or by editing this file.
+#REPORT_LANG=en                                     # en | it
+#SMTP_CONF=/etc/crowdsec/notifications/email.yaml   # SMTP server, sender and recipients of the CrowdSec email plugin
+#MAIL_TO=                                           # comma separated; empty = receiver_emails from SMTP_CONF
+#SUBJECT=                                           # empty = email_subject from SMTP_CONF
+#REPORT_NAME=                                       # server name in the report; empty = FQDN
+#FAIL2BAN_LOG=/var/log/fail2ban.log                 # empty = skip fail2ban
+#NEXTCLOUD_LOG=auto                                 # auto = /var/www/nextcloud/data/nextcloud.log; empty = skip
+#MAX_ROWS=300

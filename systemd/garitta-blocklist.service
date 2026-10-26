@@ -1,0 +1,16 @@
+[Unit]
+Description=Garitta: import the Data-Shield IPv4 blocklist into CrowdSec
+Documentation=https://data-shield.eu/docs/
+Requires=crowdsec.service
+After=crowdsec.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@SBINDIR@/garitta-blocklist
+TimeoutStartSec=2h
+Nice=10
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=yes

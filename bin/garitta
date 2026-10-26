@@ -1,0 +1,188 @@
+#!/bin/bash
+# garitta - set up and manage the garitta components on a CrowdSec Local API host.
+#
+#   garitta enable blocklist [--now] [--disable-custom-sharing | --accept-custom-sharing]
+#   garitta enable digest    [--disable-realtime-email] [--move-parser-whitelists] [--now] [--to ADDR]
+#   garitta disable blocklist [--purge]      --purge: also delete the imported decisions and the state
+#   garitta disable digest    [--restore]    --restore: undo --disable-realtime-email/--move-parser-whitelists
+#   garitta set <blocklist|digest> KEY=VALUE...
+#   garitta status
+#   garitta version
+set -euo pipefail
+VERSION=0.1.0
+BIN_DIR=$(dirname "$(readlink -f "$0")")
+CS_DIR=/etc/crowdsec
+BACKUP=$CS_DIR/.garitta-backup
+
+die() { echo "error: $*" >&2; exit 1; }
+warn() { echo "warning: $*" >&2; }
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
+need_root() { [ "$(id -u)" -eq 0 ] || [ -n "${GARITTA_CONF_DIR:-}" ] || die "run as root"; }
+conf_file() { echo "${GARITTA_CONF_DIR:-/etc/default}/garitta-$1"; }
+component() { case ${1:-} in blocklist|digest) ;; *) die "unknown component '${1:-}' (blocklist|digest)" ;; esac; }
+
+check_lapi() {
+  command -v cscli >/dev/null || die "cscli not found: install CrowdSec first"
+  cscli lapi status >/dev/null 2>&1 || die "Local API unreachable: garitta must run on the host that runs the CrowdSec Local API"
+}
+
+set_opts() {  # set_opts <component> KEY=VALUE...
+  local f; f=$(conf_file "$1"); shift
+  [ -e "$f" ] || : > "$f"
+  for kv in "$@"; do
+    [[ $kv =~ ^[A-Z_]+=.*$ ]] || die "expected KEY=VALUE, got '$kv'"
+    local k=${kv%%=*} v=${kv#*=}
+    sed -i "/^#\?$k=/d" "$f"
+    printf '%s="%s"\n' "$k" "${v//\"/}" >> "$f"
+  done
+}
+
+crowdsec_reload() {
+  if command -v crowdsec >/dev/null && ! crowdsec -c $CS_DIR/config.yaml -t >/dev/null 2>&1; then
+    die "CrowdSec configuration test failed after the change; backups are in $BACKUP"
+  fi
+  systemctl reload crowdsec && echo "crowdsec reloaded"
+}
+
+# Alerts created by `cscli decisions import` have origin cscli-import and no scenario hash, so the
+# Local API classifies them as "custom" and pushes them, decisions included, to the Central API when
+# the console option "custom" is on (pkg/apiserver/apic.go). See docs/en/design-notes.md.
+custom_sharing() {
+  cscli console status -o json 2>/dev/null | python3 -I -c '
+import sys, json
+try:
+    print("on" if json.load(sys.stdin)["sharing_options"]["custom"] else "off")
+except Exception:
+    print("n/a")' || echo n/a
+}
+
+enable_blocklist() {
+  local now=no sharing=check
+  for a in "$@"; do
+    case $a in
+      --now) now=yes ;;
+      --disable-custom-sharing) sharing=disable ;;
+      --accept-custom-sharing) sharing=accept ;;
+      *) die "unknown option for enable blocklist: $a" ;;
+    esac
+  done
+  check_lapi
+  for c in curl python3 sha256sum flock; do command -v $c >/dev/null || die "missing command: $c"; done
+  [ "$(cscli bouncers list -o raw 2>/dev/null | tail -n +2 | grep -c . || true)" -gt 0 ] ||
+    warn "no bouncer registered: decisions will not be enforced"
+  cscli allowlists list >/dev/null 2>&1 ||
+    warn "this CrowdSec version has no Local API allowlists (>= 1.6.8): trusted IPs will not be skipped"
+  case "$(custom_sharing)" in
+    on)
+      case $sharing in
+        check) die "the console option 'custom' is on: every import would be pushed to the CrowdSec Central API.
+  Re-run with --disable-custom-sharing or --accept-custom-sharing (see docs/en/blocklist.md)." ;;
+        disable) cscli console disable custom && systemctl reload crowdsec && echo "console sharing of custom alerts disabled" ;;
+        accept) warn "custom sharing stays on: imports will be pushed to the Central API" ;;
+      esac ;;
+    *) echo "custom alert sharing with the Central API: $(custom_sharing)" ;;
+  esac
+  systemctl enable --now garitta-blocklist.timer
+  systemctl list-timers garitta-blocklist.timer --no-pager | sed -n 2p
+  if [ "$now" = yes ]; then
+    echo "first import running..."
+    local rc=0; systemctl start garitta-blocklist.service || rc=$?
+    journalctl -u garitta-blocklist --since "-30min" --no-pager -o cat | tail -15
+    [ "$rc" -eq 0 ] || die "first import failed"
+  fi
+}
+
+enable_digest() {
+  local now=no to= rt=no move=no reload=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --now) now=yes ;;
+      --to) to=${2:?--to needs an address}; shift ;;
+      --disable-realtime-email) rt=yes ;;
+      --move-parser-whitelists) move=yes ;;
+      *) die "unknown option for enable digest: $1" ;;
+    esac
+    shift
+  done
+  check_lapi
+  python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "python >= 3.8 required"
+  local smtp; smtp=$(sed -n 's/^SMTP_CONF="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$(conf_file digest)" 2>/dev/null)
+  smtp=${smtp:-$CS_DIR/notifications/email.yaml}
+  grep -q '^type: *email' "$smtp" 2>/dev/null || die "CrowdSec email plugin configuration not found in $smtp"
+  mkdir -p "$BACKUP"
+  local prof=$CS_DIR/profiles.yaml
+  if [ "$rt" = yes ] && grep -qE '^\s*-\s*email_default' $prof; then
+    cp -p $prof "$BACKUP/profiles.yaml.$(date +%Y%m%d%H%M%S)"
+    sed -i -E 's/^(\s*)-\s*email_default(.*)$/\1#- email_default\2  # disabled by garitta/' $prof
+    echo "real-time email notifications disabled in $prof"; reload=1
+  fi
+  local state f n
+  while IFS=$'\t' read -r state f n _; do
+    if [ "$move" = yes ] && [ "$state" = covered ]; then
+      mkdir -p "$BACKUP/parsers"
+      mv "$f" "$BACKUP/parsers/$(echo "${f#"$CS_DIR"/}" | tr / _)"
+      echo "parser whitelist moved to $BACKUP/parsers: $f"; reload=1
+    elif [ "$move" = yes ]; then
+      warn "parser whitelist kept ($state): $f"
+    else
+      echo "note: $f ($n entries, $state) drops events before scenarios: bans it avoids will not show in the report"
+    fi
+  done < <("$BIN_DIR/garitta-digest" --check-parser-whitelists)
+  [ -z "$reload" ] || crowdsec_reload
+  systemctl enable --now garitta-digest.timer
+  systemctl list-timers garitta-digest.timer --no-pager | sed -n 2p
+  if [ "$now" = yes ]; then
+    "$BIN_DIR/garitta-digest" --since 24h ${to:+--to "$to"}
+  fi
+}
+
+disable_blocklist() {
+  systemctl disable --now garitta-blocklist.timer 2>/dev/null || true
+  if [ "${1:-}" = --purge ]; then
+    local profile=standard reason=
+    # shellcheck source=/dev/null
+    . <(grep -E '^(PROFILE|REASON)=' "$(conf_file blocklist)" 2>/dev/null || true)
+    reason=${REASON:-data-shield-${PROFILE:-$profile}}
+    cscli decisions delete --origin cscli-import --scenario "$reason" || true
+    rm -rf /var/lib/garitta/blocklist
+  fi
+  echo "blocklist disabled"
+}
+
+disable_digest() {
+  systemctl disable --now garitta-digest.timer 2>/dev/null || true
+  if [ "${1:-}" = --restore ]; then
+    sed -i -E 's/^(\s*)#- email_default(.*)  # disabled by garitta$/\1- email_default\2/' $CS_DIR/profiles.yaml
+    for f in "$BACKUP"/parsers/*.yaml; do
+      [ -e "$f" ] || continue
+      local dst; dst=$CS_DIR/$(basename "$f" | sed -E 's#^(parsers|postoverflows)_(s[0-9]+-[a-z]+)_#\1/\2/#')
+      mv "$f" "$dst" && echo "restored $dst"
+    done
+    crowdsec_reload
+  fi
+  echo "digest disabled"
+}
+
+status() {
+  echo "garitta $VERSION"
+  for c in blocklist digest; do
+    printf '%-10s timer %-8s next: %s\n' "$c" "$(systemctl is-enabled garitta-$c.timer 2>/dev/null || echo off)" \
+      "$(systemctl list-timers garitta-$c.timer --no-pager 2>/dev/null | sed -n 2p | awk '{print $1, $2, $3}')"
+    printf '%-10s last run: %s\n' "" "$(systemctl show garitta-$c.service -p Result --value 2>/dev/null)"
+  done
+  [ -r /var/lib/garitta/blocklist/status ] && sed 's/^/  blocklist /' /var/lib/garitta/blocklist/status
+  [ -r /var/lib/garitta/digest/last_sent ] && echo "  digest last_sent=$(cat /var/lib/garitta/digest/last_sent)"
+  command -v cscli >/dev/null && echo "  console custom sharing: $(custom_sharing)"
+  return 0
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+  enable)  need_root; component "${1:-}"; c=$1; shift; "enable_$c" "$@" ;;
+  disable) need_root; component "${1:-}"; c=$1; shift; "disable_$c" "$@" ;;
+  set)     need_root; component "${1:-}"; c=$1; shift; [ $# -gt 0 ] || die "nothing to set"; set_opts "$c" "$@" ;;
+  status)  status ;;
+  version|--version) echo "garitta $VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac
